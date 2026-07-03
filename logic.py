@@ -65,27 +65,69 @@ def choose_move(game_state: Dict) -> str:
     return choose_move_heuristic(game_state)
 
 
+import json
+import os
+
+# Загружаем веса нейросети при старте сервера (работает мгновенно)
+WEIGHTS_PATH = os.path.join(os.path.dirname(__file__), "ppo_weights.json")
+with open(WEIGHTS_PATH, "r") as f:
+    _PPO_MODEL = json.load(f)
+
+# КРИТИЧЕСКИ ВАЖНО: Узнайте, в каком порядке ваша среда возвращает действия!
+# Обычно в Gym это: 0="up", 1="down", 2="left", 3="right" (проверьте в snake_env.py)
+ACTION_MAP = {0: "up", 1: "down", 2: "left", 3: "right"}
+
+
 def choose_move_model(game_state: Dict) -> Optional[str]:
-    """Score each legal move with the trained model; return the best."""
+    """Вместо линейной модели запускает обученную MLP нейросеть [256, 128, 64]"""
     legal = _legal_moves(game_state)
     if not legal:
         return None
 
-    names = _MODEL["feature_names"]
-    mean = _MODEL["mean"]
-    std = _MODEL["std"]
-    coef = _MODEL["coef"]
-    intercept = _MODEL["intercept"]
+    # --- 1. Формируем вектор состояния (Observation Vector) ---
+    # ВНИМАНИЕ: Сюда нужно передать точно такой же вектор/матрицу,
+    # какую ваша среда BattlesnakeRLEnv генерирует внутри метода reset() или step().
+    # Если ваша среда принимает на вход те самые 13 фич, код будет таким:
+    # (Если среда принимает карту 11х11, вам нужно будет сформировать ее здесь)
+    
+    # Пример для 13 фич (возьмем дефолтный ход "up" просто для генерации базовых фич):
+    feats_dict = _candidate_features(game_state, "up")
+    features_names = [
+        "space_capped", "open_space", "voronoi", "reaches_tail", "escape",
+        "h2h_danger", "near_bigger_head", "near_enemy_head", "wall_dist",
+        "food_score", "food_delta", "is_food", "dist_to_center"
+    ]
+    obs_vector = [feats_dict.get(name, 0.0) for name in features_names]
 
-    best_move, best_score = None, float("-inf")
-    for move in legal:
-        feats = _candidate_features(game_state, move)
-        score = intercept
-        for i, name in enumerate(names):
-            z = (feats.get(name, 0.0) - mean[i]) / std[i] if std[i] else 0.0
-            score += coef[i] * z
-        if score > best_score:
-            best_score, best_move = score, move
+    # --- 2. Forward Pass (Нейросеть на чистом Python) ---
+    def relu(vector):
+        return [max(0.0, x) for x in vector]
+
+    def layer_forward(x, W, b):
+        output = []
+        for row, bias in zip(W, b):
+            output.append(sum(x_i * w_i for x_i, w_i in zip(x, row)) + bias)
+        return output
+
+    # Прогоняем через 3 скрытых слоя вашей архитектуры [256, 128, 64]
+    h0 = relu(layer_forward(obs_vector, _PPO_MODEL["W_hidden_0"], _PPO_MODEL["b_hidden_0"]))
+    h1 = relu(layer_forward(h0, _PPO_MODEL["W_hidden_1"], _PPO_MODEL["b_hidden_1"]))
+    h2 = relu(layer_forward(h1, _PPO_MODEL["W_hidden_2"], _PPO_MODEL["b_hidden_2"]))
+    
+    # Получаем финальные 4 логита (оценки для каждого из 4 направлений)
+    logits = layer_forward(h2, _PPO_MODEL["W_action"], _PPO_MODEL["b_action"])
+
+    # --- 3. Выбираем лучшее разрешенное действие ---
+    best_move = None
+    best_score = float("-inf")
+    
+    for action_idx, move_name in ACTION_MAP.items():
+        if move_name in legal: # Выбираем только среди безопасных ходов!
+            score = logits[action_idx]
+            if score > best_score:
+                best_score = score
+                best_move = move_name
+
     return best_move
 
 

@@ -1,19 +1,33 @@
+# Создайте файл export_ppo.py и запустите его локально
+import json
+import torch
 from stable_baselines3 import PPO
-from snake_env import BattlesnakeRLEnv  # Ваша кастомная среда
+from snake_env import BattlesnakeRLEnv
 
-# 1. Инициализируем среду
-env = BattlesnakeRLEnv()
+def main():
+    # 1. Загружаем обученную модель
+    model = PPO.load("ppo_battlesnake_11x11")
+    policy = model.policy
 
-# 2. ЗАГРУЖАЕМ существующую модель вместо создания новой
-# Мы передаем путь к старому zip-архиву и привязываем его к среде
-model = PPO.load("ppo_battlesnake_11x11.zip", env=env)
-print(">>> Старая модель успешно загружена. Начинаем дообучение... <<<")
+    weights = {}
 
-# 3. Запускаем дообучение
-# КРИТИЧЕСКИ ВАЖНО: reset_num_timesteps=False
-# Этот флаг говорит модели продолжить график обучения (и LR scheduler), а не сбрасывать его в ноль
-model.learn(total_timesteps=100000, reset_num_timesteps=False)
+    # 2. Извлекаем слои mlp_extractor (архитектуру pi=[256, 128, 64])
+    # Находим все полносвязные слои в сети стратегии
+    layers = [m for m in policy.mlp_extractor.policy_net if isinstance(m, torch.nn.Linear)]
+    
+    for i, layer in enumerate(layers):
+        weights[f"W_hidden_{i}"] = layer.weight.detach().cpu().numpy().tolist()
+        weights[f"b_hidden_{i}"] = layer.bias.detach().cpu().numpy().tolist()
 
-# 4. Сохраняем обновленную модель (можно под тем же или новым именем)
-model.save("ppo_battlesnake_11x11_v2.zip")
-print(">>> Дообучение завершено! Новая версия модели сохранена. <<<")
+    # 3. Извлекаем финальный слой, который выдает 4 действия (action_net)
+    weights["W_action"] = policy.action_net.weight.detach().cpu().numpy().tolist()
+    weights["b_action"] = policy.action_net.bias.detach().cpu().numpy().tolist()
+
+    # 4. Сохраняем всё в компактный JSON
+    with open("ppo_weights.json", "w") as f:
+        json.dump(weights, f)
+        
+    print("🔥 Веса нейросети успешно сохранены в файл ppo_weights.json!")
+
+if __name__ == "__main__":
+    main()
