@@ -9,6 +9,7 @@ Implements the four endpoints the Battlesnake game engine calls:
 
 import logging
 import os
+import time
 
 from flask import Flask, request
 
@@ -34,8 +35,9 @@ def on_start():
 
 @app.post("/move")
 def on_move():
+    request_start = time.monotonic()
     game_state = request.get_json()
-    move = choose_move(game_state)
+    move = choose_move(game_state, request_start)
     log.info("MOVE turn=%s -> %s", game_state["turn"], move)
     return {"move": move}
 

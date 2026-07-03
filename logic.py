@@ -44,13 +44,20 @@ def get_info() -> Dict[str, str]:
     }
 
 
-def choose_move(game_state: Dict) -> str:
+def choose_move(game_state: Dict, request_start: Optional[float] = None) -> str:
     """Return the next move using lookahead search, falling back to the
     1-ply model, then the heuristic, so gameplay always returns a legal move.
+
+    ``request_start`` should be ``time.monotonic()`` captured as early as
+    possible in the HTTP handler, so the search's time budget accounts for
+    Flask/JSON overhead too, not just its own compute. Defaults to "now" if
+    not supplied (e.g. when called directly, outside the server).
     """
+    if request_start is None:
+        request_start = time.monotonic()
     move = None
     try:
-        move = choose_move_search(game_state)
+        move = choose_move_search(game_state, request_start)
     except Exception:  # noqa: BLE001 - search must never break gameplay
         move = None
     if move is None:
@@ -235,10 +242,24 @@ def _max_enemy_length(snakes: List[Dict], my_id: str) -> int:
 # finished before the time budget ran out. A deeper search in progress is
 # simply abandoned (via ``_TimeUp``) rather than returned partially.
 
-_TIME_BUDGET_SECONDS = 0.35
 _MAX_SEARCH_DEPTH = 8
 _LOSS_SCORE = -1_000_000.0
 _WIN_SCORE = 1_000_000.0
+
+# Battlesnake's default per-move timeout is 500ms if the game doesn't specify
+# one. We reserve a chunk of it for Flask/JSON overhead and network jitter
+# (Render's free tier in particular can add noticeable latency) so a slow
+# request never causes the *engine* to time us out and substitute its own
+# (often fatal) default move — that's strictly worse than returning a
+# shallower but valid search result.
+_DEFAULT_MOVE_TIMEOUT_MS = 500
+_TIMEOUT_SAFETY_MARGIN_MS = 220
+_MIN_TIME_BUDGET_SECONDS = 0.05
+
+
+def _time_budget_seconds(game_state: Dict) -> float:
+    timeout_ms = game_state.get("game", {}).get("timeout") or _DEFAULT_MOVE_TIMEOUT_MS
+    return max(timeout_ms - _TIMEOUT_SAFETY_MARGIN_MS, _MIN_TIME_BUDGET_SECONDS * 1000) / 1000.0
 
 
 class _TimeUp(Exception):
@@ -533,11 +554,12 @@ def _search_root(
     return best_move, best_val
 
 
-def choose_move_search(game_state: Dict) -> Optional[str]:
+def choose_move_search(game_state: Dict, request_start: Optional[float] = None) -> Optional[str]:
     """Iterative-deepening minimax/alpha-beta search against the nearest
-    opponent, time-boxed to ``_TIME_BUDGET_SECONDS``. Returns the best move
-    found at the deepest fully-completed depth, or ``None`` if not even a
-    depth-1 search could finish (so the caller falls back to the 1-ply model).
+    opponent, time-boxed relative to the game's actual move timeout. Returns
+    the best move found at the deepest fully-completed depth, or ``None`` if
+    not even a depth-1 search could finish (so the caller falls back to the
+    1-ply model).
     """
     board = game_state["board"]
     my_id = game_state["you"]["id"]
@@ -545,7 +567,8 @@ def choose_move_search(game_state: Dict) -> Optional[str]:
         return None
     opp_id = _nearest_opponent_id(board, my_id)
 
-    deadline = time.monotonic() + _TIME_BUDGET_SECONDS
+    start = request_start if request_start is not None else time.monotonic()
+    deadline = start + _time_budget_seconds(game_state)
     best_move: Optional[str] = None
     depth = 1
     try:
