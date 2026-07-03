@@ -3,30 +3,10 @@
 The served policy uses a linear ranking model, scores each legal move,
 and returns the highest-scoring direction. A compact heuristic remains as a
 fallback so gameplay still returns a legal move if model scoring fails.
-
-Board coordinates: ``(0, 0)`` is the bottom-left corner.
-  up    -> y + 1
-  down  -> y - 1
-  left  -> x - 1
-  right -> x + 1
-
-Game-state schema reference: https://docs.battlesnake.com/api
 """
 
 from collections import deque
 from typing import Dict, List, Optional, Set, Tuple
-import os
-from stable_baselines3 import PPO
-import numpy as np
-
-# Автозагрузка весов при запуске сервера Flask
-MODEL_PATH = "ppo_battlesnake_11x11.zip"
-if os.path.exists(MODEL_PATH):
-    RL_MODEL = PPO.load(MODEL_PATH)
-    print(">>> ИИ-модель PPO успешно подключена и готова к бою! <<<")
-else:
-    RL_MODEL = None
-    print(">>> ВНИМАНИЕ: Файл модели не найден. Работает хвристический фолбек! <<<")
 
 Point = Tuple[int, int]
 
@@ -56,14 +36,164 @@ def get_info() -> Dict[str, str]:
 
 
 def choose_move(game_state: Dict) -> str:
-    """Return the next move using the model, with a heuristic fallback."""
+    """Оркестратор (Идеальный симбиоз): 
+    Глобально стратегию выбирает МЛ, но Лукахед проверяет её безопасность.
+    """
     try:
-        move = choose_move_model(game_state)
-    except Exception:  # noqa: BLE001 - a model issue must never break gameplay
-        move = None
-    if move is not None:
-        return move
+        # 1. Запрашиваем ход у нашей линейной МЛ-модели
+        ml_move = choose_move_model(game_state)
+        
+        if ml_move:
+            # --- СИМБИОЗ: Валидация хода ручным алгоритмом ---
+            # Проверяем ход модели через 2-шаговый просмотр вперед
+            if _is_move_safe_lookahead(ml_move, game_state):
+                return ml_move
+            else:
+                print(f">>> [СИМБИОЗ] МЛ выбрал ход '{ml_move}', но Лукахед обнаружил ловушку! Переключаем на ручной режим. <<<")
+    except Exception:  
+        pass
+
+    try:
+        # 2. Если МЛ-ход забракован или произошла ошибка — управление перехватывает ручной Лукахед
+        lookahead_move = choose_move_lookahead(game_state)
+        if lookahead_move:
+            return lookahead_move
+    except Exception:
+        pass
+
+    # 3. Финальный железный щит
     return choose_move_heuristic(game_state)
+
+
+def choose_move_model(game_state: Dict) -> Optional[str]:
+    """Score each legal move with the trained model; return the best."""
+    legal = _legal_moves(game_state)
+    if not legal:
+        return None
+
+    names = _MODEL["feature_names"]
+    mean = _MODEL["mean"]
+    std = _MODEL["std"]
+    coef = _MODEL["coef"]
+    intercept = _MODEL["intercept"]
+
+    best_move, best_score = None, float("-inf")
+    for move in legal:
+        feats = _candidate_features(game_state, move)
+        score = intercept
+        for i, name in enumerate(names):
+            z = (feats.get(name, 0.0) - mean[i]) / std[i] if std[i] else 0.0
+            score += coef[i] * z
+        if score > best_score:
+            best_score, best_move = score, move
+    return best_move
+
+
+def choose_move_lookahead(game_state: Dict) -> Optional[str]:
+    """Безопасный ручной алгоритм с 2-шаговым просмотром пространства."""
+    board = game_state["board"]
+    you = game_state["you"]
+    width, height = board["width"], board["height"]
+    
+    head: Point = (you["head"]["x"], you["head"]["y"])
+    my_length: int = you["length"]
+    health: int = you["health"]
+
+    legal_moves = _legal_moves(game_state)
+    if not legal_moves:
+        return None
+
+    occupied = _occupied_cells(board["snakes"])
+    danger = _head_to_head_cells(board["snakes"], you["id"], my_length)
+    foods = [(f["x"], f["y"]) for f in board["food"]]
+
+    best_move = None
+    best_score = float("-inf")
+
+    for move in legal_moves:
+        dx, dy = DIRECTIONS[move]
+        nxt = (head[0] + dx, head[1] + dy)
+
+        # ШАГ 1: Текущее пространство
+        immediate_space = _flood_fill(nxt, occupied, width, height, limit=my_length + 2)
+        move_score = immediate_space - 5000 if immediate_space <= my_length else float(immediate_space)
+
+        if nxt in danger:
+            move_score -= HEAD_TO_HEAD_PENALTY
+
+        if foods and health < HUNGRY_THRESHOLD:
+            nearest = min(_manhattan(nxt, f) for f in foods)
+            move_score += (width + height - nearest) * 5
+
+        # ШАГ 2: Просмотр на шаг вперед (Lookahead)
+        simulated_occupied = occupied.copy()
+        if len(you["body"]) > 0:
+            my_tail = (you["body"][-1]["x"], you["body"][-1]["y"])
+            if my_tail in simulated_occupied:
+                simulated_occupied.remove(my_tail)
+
+        max_next_space = 0
+        has_safe_escape = False
+
+        for _, (ndx, ndy) in DIRECTIONS.items():
+            future_cell = (nxt[0] + ndx, nxt[1] + ndy)
+            if _in_bounds(future_cell, width, height) and future_cell not in simulated_occupied:
+                future_space = _flood_fill(future_cell, simulated_occupied, width, height, limit=my_length + 2)
+                if future_space > max_next_space:
+                    max_next_space = future_space
+                if future_space > my_length:
+                    has_safe_escape = True
+
+        if not has_safe_escape and max_next_space <= my_length:
+            move_score -= 8000
+        else:
+            move_score += max_next_space
+
+        if move_score > best_score:
+            best_score = move_score
+            best_move = move
+
+    return best_move
+
+
+def _is_move_safe_lookahead(move: str, game_state: Dict) -> bool:
+    """Вспомогательная функция проверки: безопасен ли конкретный ход МЛ."""
+    board = game_state["board"]
+    you = game_state["you"]
+    width, height = board["width"], board["height"]
+    head = (you["head"]["x"], you["head"]["y"])
+    my_length = you["length"]
+    
+    dx, dy = DIRECTIONS[move]
+    nxt = (head[0] + dx, head[1] + dy)
+    
+    occupied = _occupied_cells(board["snakes"])
+    if nxt in occupied or not _in_bounds(nxt, width, height):
+        return False
+        
+    # Проверка доступного места сразу
+    immediate_space = _flood_fill(nxt, occupied, width, height, limit=my_length + 2)
+    if immediate_space <= my_length:
+        return False
+        
+    # Моделируем симуляцию освобождения хвоста
+    simulated_occupied = occupied.copy()
+    if len(you["body"]) > 0:
+        my_tail = (you["body"][-1]["x"], you["body"][-1]["y"])
+        if my_tail in simulated_occupied:
+            simulated_occupied.remove(my_tail)
+            
+    # Проверяем, будет ли хоть один безопасный выход на следующем ходу
+    has_safe_escape = False
+    for _, (ndx, ndy) in DIRECTIONS.items():
+        future_cell = (nxt[0] + ndx, nxt[1] + ndy)
+        if _in_bounds(future_cell, width, height) and future_cell not in simulated_occupied:
+            future_space = _flood_fill(future_cell, simulated_occupied, width, height, limit=my_length + 2)
+            if future_space > my_length:
+                has_safe_escape = True
+                break
+                
+    return has_safe_escape
 
 
 def choose_move_heuristic(game_state: Dict) -> str:
@@ -92,15 +222,12 @@ def choose_move_heuristic(game_state: Dict) -> str:
         if nxt in occupied:
             continue
 
-        # Reachable open space from this cell. If we can't fit our own body in
-        # the space we'd be moving into, we're about to trap ourselves.
         space = _flood_fill(nxt, occupied, width, height, limit=my_length + 1)
         score = float(space)
 
         if nxt in danger:
             score -= HEAD_TO_HEAD_PENALTY
 
-        # When hungry, nudge toward the closest food.
         if foods and health < HUNGRY_THRESHOLD:
             nearest = min(_manhattan(nxt, f) for f in foods)
             score += (width + height - nearest) * 2
@@ -109,16 +236,23 @@ def choose_move_heuristic(game_state: Dict) -> str:
             best_score = score
             best_move = move
 
-    # No safe move found -> we're cornered. Move up and hope for the best.
     return best_move or "up"
 
 
-def _occupied_cells(snakes: List[Dict]) -> Set[Point]:
-    """All cells currently filled by any snake's body.
+def _legal_moves(game_state: Dict) -> List[str]:
+    board = game_state["board"]
+    width, height = board["width"], board["height"]
+    head = (game_state["you"]["head"]["x"], game_state["you"]["head"]["y"])
+    occupied = _occupied_cells(board["snakes"])
+    return [
+        move
+        for move, (dx, dy) in DIRECTIONS.items()
+        if _in_bounds((head[0] + dx, head[1] + dy), width, height)
+        and (head[0] + dx, head[1] + dy) not in occupied
+    ]
 
-    We keep tails occupied too; they only free up *next* turn and treating them
-    as solid is the conservative, safe choice for a base bot.
-    """
+
+def _occupied_cells(snakes: List[Dict]) -> Set[Point]:
     occupied: Set[Point] = set()
     for snake in snakes:
         for seg in snake["body"]:
@@ -127,12 +261,6 @@ def _occupied_cells(snakes: List[Dict]) -> Set[Point]:
 
 
 def _head_to_head_cells(snakes: List[Dict], my_id: str, my_length: int) -> Set[Point]:
-    """Cells adjacent to enemy heads that are >= our length.
-
-    Moving onto one of these risks a head-to-head collision we would lose or
-    tie, so they are heavily penalized (but not forbidden — sometimes it's the
-    only move).
-    """
     danger: Set[Point] = set()
     for snake in snakes:
         if snake["id"] == my_id:
@@ -146,10 +274,6 @@ def _head_to_head_cells(snakes: List[Dict], my_id: str, my_length: int) -> Set[P
 
 
 def _flood_fill(start: Point, occupied: Set[Point], width: int, height: int, limit: int) -> int:
-    """Count open cells reachable from ``start`` (capped at ``limit``).
-
-    Used to avoid moves that would seal us into a small pocket.
-    """
     seen: Set[Point] = {start}
     stack: List[Point] = [start]
     count = 0
@@ -186,7 +310,6 @@ _NEIGHBORS = ((0, 1), (0, -1), (-1, 0), (1, 0))
 
 
 def _bfs_dist(sources, blocked, width, height):
-    """Shortest free-cell distances from seed cells."""
     dist = {}
     dq = deque()
     for source in sources:
@@ -205,7 +328,6 @@ def _bfs_dist(sources, blocked, width, height):
 
 
 def _candidate_features(state: Dict, move: str) -> Dict[str, float]:
-    """Feature vector for playing ``move`` from ``state``. Assumes ``move`` is legal."""
     board = state["board"]
     you = state["you"]
     width, height = board["width"], board["height"]
@@ -223,12 +345,10 @@ def _candidate_features(state: Dict, move: str) -> Dict[str, float]:
     enemy_heads = [(s["head"]["x"], s["head"]["y"]) for s in enemies]
     bigger_heads = [(s["head"]["x"], s["head"]["y"]) for s in enemies if s["length"] >= my_length]
 
-    # Voronoi control: cells we reach strictly before any enemy.
     my_dist = _bfs_dist([nxt], occupied, width, height)
     enemy_dist = _bfs_dist(enemy_heads, occupied, width, height) if enemy_heads else {}
     voronoi = sum(1 for cell, md in my_dist.items() if md < enemy_dist.get(cell, _BIG))
 
-    # Tail reachability is a useful anti-self-trap signal.
     my_tail = (you["body"][-1]["x"], you["body"][-1]["y"])
     reach = _bfs_dist([nxt], occupied - {my_tail}, width, height)
     reaches_tail = 1.0 if my_tail in reach else 0.0
@@ -262,7 +382,6 @@ def _candidate_features(state: Dict, move: str) -> Dict[str, float]:
 
 
 # --- Model -----------------------------------------------------
-# Embedded standardized linear model.
 
 _MODEL: Dict = {
     "feature_names": [
@@ -328,98 +447,3 @@ _MODEL: Dict = {
     "intercept": 0.0,
     "top1_accuracy": 0.9928571428571429,
 }
-
-
-def choose_move_model(game_state: Dict) -> Optional[str]:
-    if RL_MODEL is None:
-        return None
-
-    legal = _legal_moves(game_state)
-    if not legal:
-        return None
-
-    # Извлекаем инфо о текущем состоянии для пространственных фичей
-    head = (game_state["you"]["body"][0]["x"], game_state["you"]["body"][0]["y"])
-    
-    # Список координат всей еды на поле
-    foods = [(f["x"], f["y"]) for f in game_state["board"]["food"]]
-    
-    # Список координат голов ВСЕХ врагов
-    enemies = []
-    for snake in game_state["board"]["snakes"]:
-        if snake["id"] != game_state["you"]["id"]:
-            enemies.append((snake["body"][0]["x"], snake["body"][0]["y"]))
-
-    obs_vector = []
-    feature_order = [
-        "space_capped", "open_space", "voronoi", "reaches_tail", "escape",
-        "h2h_danger", "near_bigger_head", "near_enemy_head", "wall_dist",
-        "food_score", "food_delta", "is_food", "dist_to_center"
-    ]
-    
-    action_map = {0: "up", 1: "down", 2: "left", 3: "right"}
-    
-    # Собираем 68 фичей точно так же, как при обучении
-    for act_idx in range(4):
-        move = action_map[act_idx]
-        if move not in legal:
-            obs_vector.extend([0.0] * 17)
-            continue
-            
-        try:
-            dx_dir, dy_dir = DIRECTIONS[move]
-            nxt = (head[0] + dx_dir, head[1] + dy_dir)
-            
-            feats = _candidate_features(game_state, move)
-            
-            # 13 базовых фичей с нормализацией под 11х11
-            for name in feature_order:
-                val = float(feats.get(name, 0.0))
-                if name in ["space_capped", "open_space", "voronoi"]:
-                    val /= 121.0
-                elif name in ["wall_dist", "dist_to_center"]:
-                    val /= 11.0
-                obs_vector.append(val)
-                
-            # 4 Пространственные фичи (векторы до еды и врага из будущей точки)
-            food_dx, food_dy = 0.0, 0.0
-            if foods:
-                closest_f = min(foods, key=lambda p: abs(p[0]-nxt[0]) + abs(p[1]-nxt[1]))
-                food_dx = (closest_f[0] - nxt[0]) / 11.0
-                food_dy = (closest_f[1] - nxt[1]) / 11.0
-                
-            enemy_dx, enemy_dy = 0.0, 0.0
-            if enemies:
-                closest_e = min(enemies, key=lambda p: abs(p[0]-nxt[0]) + abs(p[1]-nxt[1]))
-                enemy_dx = (closest_e[0] - nxt[0]) / 11.0
-                enemy_dy = (closest_e[1] - nxt[1]) / 11.0
-                
-            obs_vector.extend([food_dx, food_dy, enemy_dx, enemy_dy])
-            
-        except Exception:
-            obs_vector.extend([0.0] * 17)
-
-    obs_array = np.array(obs_vector, dtype=np.float32)
-    
-    # Инференс модели PPO
-    action, _states = RL_MODEL.predict(obs_array, deterministic=True)
-    chosen_move = action_map[int(action)]
-    
-    # Железная страховка: если нейросеть ошиблась и выбрала смерть, берем первый безопасный ход
-    if chosen_move not in legal:
-        return legal[0]
-        
-    return chosen_move
-
-
-def _legal_moves(game_state: Dict) -> List[str]:
-    board = game_state["board"]
-    width, height = board["width"], board["height"]
-    head = (game_state["you"]["head"]["x"], game_state["you"]["head"]["y"])
-    occupied = _occupied_cells(board["snakes"])
-    return [
-        move
-        for move, (dx, dy) in DIRECTIONS.items()
-        if _in_bounds((head[0] + dx, head[1] + dy), width, height)
-        and (head[0] + dx, head[1] + dy) not in occupied
-    ]
