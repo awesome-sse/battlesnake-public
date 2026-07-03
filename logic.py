@@ -15,6 +15,18 @@ Game-state schema reference: https://docs.battlesnake.com/api
 
 from collections import deque
 from typing import Dict, List, Optional, Set, Tuple
+import os
+from stable_baselines3 import PPO
+import numpy as np
+
+# Автозагрузка весов при запуске сервера Flask
+MODEL_PATH = "ppo_battlesnake_11x11.zip"
+if os.path.exists(MODEL_PATH):
+    RL_MODEL = PPO.load(MODEL_PATH)
+    print(">>> ИИ-модель PPO успешно подключена и готова к бою! <<<")
+else:
+    RL_MODEL = None
+    print(">>> ВНИМАНИЕ: Файл модели не найден. Работает хвристический фолбек! <<<")
 
 Point = Tuple[int, int]
 
@@ -319,31 +331,85 @@ _MODEL: Dict = {
 
 
 def choose_move_model(game_state: Dict) -> Optional[str]:
-    """Score each legal move with the trained model; return the best.
+    if RL_MODEL is None:
+        return None
 
-    Returns ``None`` (so the caller falls back to the heuristic) if the model
-    isn't available or the snake is trapped with no legal move.
-    """
     legal = _legal_moves(game_state)
     if not legal:
         return None
 
-    names = _MODEL["feature_names"]
-    mean = _MODEL["mean"]
-    std = _MODEL["std"]
-    coef = _MODEL["coef"]
-    intercept = _MODEL["intercept"]
+    # Извлекаем инфо о текущем состоянии для пространственных фичей
+    head = (game_state["you"]["body"][0]["x"], game_state["you"]["body"][0]["y"])
+    
+    # Список координат всей еды на поле
+    foods = [(f["x"], f["y"]) for f in game_state["board"]["food"]]
+    
+    # Список координат голов ВСЕХ врагов
+    enemies = []
+    for snake in game_state["board"]["snakes"]:
+        if snake["id"] != game_state["you"]["id"]:
+            enemies.append((snake["body"][0]["x"], snake["body"][0]["y"]))
 
-    best_move, best_score = None, float("-inf")
-    for move in legal:
-        feats = _candidate_features(game_state, move)
-        score = intercept
-        for i, name in enumerate(names):
-            z = (feats.get(name, 0.0) - mean[i]) / std[i] if std[i] else 0.0
-            score += coef[i] * z
-        if score > best_score:
-            best_score, best_move = score, move
-    return best_move
+    obs_vector = []
+    feature_order = [
+        "space_capped", "open_space", "voronoi", "reaches_tail", "escape",
+        "h2h_danger", "near_bigger_head", "near_enemy_head", "wall_dist",
+        "food_score", "food_delta", "is_food", "dist_to_center"
+    ]
+    
+    action_map = {0: "up", 1: "down", 2: "left", 3: "right"}
+    
+    # Собираем 68 фичей точно так же, как при обучении
+    for act_idx in range(4):
+        move = action_map[act_idx]
+        if move not in legal:
+            obs_vector.extend([0.0] * 17)
+            continue
+            
+        try:
+            dx_dir, dy_dir = DIRECTIONS[move]
+            nxt = (head[0] + dx_dir, head[1] + dy_dir)
+            
+            feats = _candidate_features(game_state, move)
+            
+            # 13 базовых фичей с нормализацией под 11х11
+            for name in feature_order:
+                val = float(feats.get(name, 0.0))
+                if name in ["space_capped", "open_space", "voronoi"]:
+                    val /= 121.0
+                elif name in ["wall_dist", "dist_to_center"]:
+                    val /= 11.0
+                obs_vector.append(val)
+                
+            # 4 Пространственные фичи (векторы до еды и врага из будущей точки)
+            food_dx, food_dy = 0.0, 0.0
+            if foods:
+                closest_f = min(foods, key=lambda p: abs(p[0]-nxt[0]) + abs(p[1]-nxt[1]))
+                food_dx = (closest_f[0] - nxt[0]) / 11.0
+                food_dy = (closest_f[1] - nxt[1]) / 11.0
+                
+            enemy_dx, enemy_dy = 0.0, 0.0
+            if enemies:
+                closest_e = min(enemies, key=lambda p: abs(p[0]-nxt[0]) + abs(p[1]-nxt[1]))
+                enemy_dx = (closest_e[0] - nxt[0]) / 11.0
+                enemy_dy = (closest_e[1] - nxt[1]) / 11.0
+                
+            obs_vector.extend([food_dx, food_dy, enemy_dx, enemy_dy])
+            
+        except Exception:
+            obs_vector.extend([0.0] * 17)
+
+    obs_array = np.array(obs_vector, dtype=np.float32)
+    
+    # Инференс модели PPO
+    action, _states = RL_MODEL.predict(obs_array, deterministic=True)
+    chosen_move = action_map[int(action)]
+    
+    # Железная страховка: если нейросеть ошиблась и выбрала смерть, берем первый безопасный ход
+    if chosen_move not in legal:
+        return legal[0]
+        
+    return chosen_move
 
 
 def _legal_moves(game_state: Dict) -> List[str]:
