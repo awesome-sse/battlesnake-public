@@ -7,7 +7,7 @@ from snake_env import BattlesnakeRLEnv
 def main():
     print("Создание параллельных сред...")
     # Запускаем 4 параллельных симулятора для быстрой сборки опыта
-    env = make_vec_env(lambda: BattlesnakeRLEnv(), n_envs=16)
+    env = make_vec_env(lambda: BattlesnakeRLEnv(), n_envs=8)
 
     # Авто-выбор девайса
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -28,7 +28,7 @@ def main():
         learning_rate=3e-4,
         n_steps=2048,
         batch_size=64,
-        n_epochs=10,
+        n_epochs=20,
         gamma=0.98,
         policy_kwargs=policy_kwargs,
         tensorboard_log=None, # Обходим баг Windows
