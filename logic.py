@@ -49,9 +49,47 @@ def choose_move(game_state: Dict) -> str:
         move = choose_move_model(game_state)
     except Exception:  # noqa: BLE001 - a model issue must never break gameplay
         move = None
-    if move is not None:
+    if move is None:
+        move = choose_move_heuristic(game_state)
+    return _avoid_avoidable_h2h(game_state, move)
+
+
+def _avoid_avoidable_h2h(game_state: Dict, move: str) -> str:
+    """Override the chosen move if it risks a losing/tying head-to-head that a
+    safer legal move would sidestep without trapping us.
+
+    The model and heuristic only *penalize* head-to-head risk in their score,
+    so a risky move can still win if other terms outweigh it. This is a hard
+    safety net on top of that scoring.
+    """
+    board = game_state["board"]
+    you = game_state["you"]
+    width, height = board["width"], board["height"]
+    head: Point = (you["head"]["x"], you["head"]["y"])
+    my_length = you["length"]
+
+    legal = _legal_moves(game_state)
+    if move not in legal or len(legal) <= 1:
         return move
-    return choose_move_heuristic(game_state)
+
+    occupied = _occupied_cells(board["snakes"])
+    danger = _head_to_head_cells(board["snakes"], you["id"], my_length)
+
+    dx, dy = DIRECTIONS[move]
+    if (head[0] + dx, head[1] + dy) not in danger:
+        return move
+
+    best_alt, best_space = None, -1
+    for alt in legal:
+        adx, ady = DIRECTIONS[alt]
+        anxt = (head[0] + adx, head[1] + ady)
+        if anxt in danger:
+            continue
+        space = _flood_fill(anxt, occupied, width, height, limit=my_length + 1)
+        if space >= my_length + 1 and space > best_space:
+            best_alt, best_space = alt, space
+
+    return best_alt or move
 
 
 def choose_move_heuristic(game_state: Dict) -> str:
@@ -68,6 +106,7 @@ def choose_move_heuristic(game_state: Dict) -> str:
     occupied = _occupied_cells(board["snakes"])
     danger = _head_to_head_cells(board["snakes"], you["id"], my_length)
     foods = [(f["x"], f["y"]) for f in board["food"]]
+    behind_in_length = my_length <= _max_enemy_length(board["snakes"], you["id"])
 
     best_move = None
     best_score = float("-inf")
@@ -88,8 +127,9 @@ def choose_move_heuristic(game_state: Dict) -> str:
         if nxt in danger:
             score -= HEAD_TO_HEAD_PENALTY
 
-        # When hungry, nudge toward the closest food.
-        if foods and health < HUNGRY_THRESHOLD:
+        # When hungry, or shorter than the biggest opponent, nudge toward food
+        # — losing a length race means losing every future head-to-head.
+        if foods and (health < HUNGRY_THRESHOLD or behind_in_length):
             nearest = min(_manhattan(nxt, f) for f in foods)
             score += (width + height - nearest) * 2
 
@@ -167,6 +207,11 @@ def _manhattan(a: Point, b: Point) -> int:
     return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
 
+def _max_enemy_length(snakes: List[Dict], my_id: str) -> int:
+    lengths = [s["length"] for s in snakes if s["id"] != my_id]
+    return max(lengths) if lengths else 0
+
+
 # --- Embedded model features -------------------------------------------------
 
 _BIG = 10_000
@@ -230,7 +275,8 @@ def _candidate_features(state: Dict, move: str) -> Dict[str, float]:
 
     nearest_now = min((_manhattan(head, f) for f in foods), default=_BIG)
     nearest_next = min((_manhattan(nxt, f) for f in foods), default=_BIG)
-    hungry = health < HUNGRY_THRESHOLD
+    behind_in_length = my_length <= _max_enemy_length(board["snakes"], you["id"])
+    hungry = health < HUNGRY_THRESHOLD or behind_in_length
 
     return {
         "space_capped": float(_flood_fill(nxt, occupied, width, height, limit=my_length + 1)),
