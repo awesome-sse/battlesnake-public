@@ -28,7 +28,7 @@ def main():
         learning_rate=3e-4,
         n_steps=2048,
         batch_size=64,
-        n_epochs=20,
+        n_epochs=30,
         gamma=0.98,
         policy_kwargs=policy_kwargs,
         tensorboard_log=None, # Обходим баг Windows
@@ -37,7 +37,7 @@ def main():
 
     print("Обучение началось. Ждем...")
     # 250k шагов — это минут 7-10 на твоем ПК. Модель будет готова!
-    model.learn(total_timesteps=250_000)
+    model.learn(total_timesteps=300_000)
     
     model.save("ppo_battlesnake_11x11")
     print("Успех! Модель ppo_battlesnake_11x11.zip сохранена.")
